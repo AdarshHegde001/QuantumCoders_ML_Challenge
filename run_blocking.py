@@ -1,26 +1,55 @@
-
-
 """
-Blocking-only pipeline.
+Blocking-only entity matching pipeline.
 
-Uses already cleaned Parquet files produced by data_cleaning.py.
+Memory-safe version.
 
-Input:
-    student_resource/dataset/processed/
-        train_source1_clean.parquet
-        train_source2_clean.parquet
-        train_source3_clean.parquet
+Pipeline:
 
-Output:
-    output/candidate_pairs_train.tsv
+    cleaned Parquet
+        |
+        v
+    batch feature generation
+        |
+        v
+    temporary blocking-feature Parquet
+        |
+        v
+    DuckDB blocking joins
+        |
+        v
+    persistent candidate-pair table
+        |
+        v
+    final TSV
+
+Designed for a ~2.3 GB total input dataset on a 24 GB RAM machine.
+
+The main goal is to avoid materializing the entire candidate-pair
+dataset inside pandas.
 """
 
 import os
 import time
-import pandas as pd
+import shutil
 
-from blocking_keys import MinHasher, add_blocking_keys, band_columns
-from candidate_generation import generate_candidates, pairs_to_id_list_rows
+import duckdb
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from blocking_keys import (
+    MinHasher,
+    add_blocking_keys,
+    band_columns,
+)
+
+from candidate_generation import (
+    configure_duckdb,
+    inspect_blocks,
+    generate_candidates,
+    write_candidate_output,
+    candidate_statistics,
+)
 
 
 # ============================================================
@@ -29,22 +58,28 @@ from candidate_generation import generate_candidates, pairs_to_id_list_rows
 
 NUM_BANDS = 8
 ROWS_PER_BAND = 3
+
 MAX_BLOCK_SIZE = 500
+
 RANDOM_SEED = 42
+
+# Number of rows processed by pandas at one time while generating
+# blocking features.
+FEATURE_BATCH_SIZE = 50_000
+
+# DuckDB is deliberately limited below the machine's 24 GB RAM.
+DUCKDB_MEMORY_LIMIT = "14GB"
+
+# Leave CPU and RAM for macOS/Python.
+DUCKDB_THREADS = 6
+
+# Disk used by DuckDB for temporary spill files.
+DUCKDB_TEMP_LIMIT = "20GB"
 
 
 # ============================================================
 # FIND PROJECT ROOT
 # ============================================================
-
-# This script is inside:
-#
-# ML Challenge/
-#     data_preparation/
-#         run_blocking_clean_only.py
-#
-# Therefore:
-# parent of data_preparation = project root
 
 CURRENT_FOLDER = os.path.dirname(
     os.path.abspath(__file__)
@@ -74,8 +109,38 @@ OUTPUT_DIR = os.path.join(
     "output"
 )
 
+TEMP_DIR = os.path.join(
+    OUTPUT_DIR,
+    "_blocking_tmp"
+)
+
+DUCKDB_TEMP_DIR = os.path.join(
+    TEMP_DIR,
+    "duckdb_tmp"
+)
+
+FEATURE_DIR = os.path.join(
+    TEMP_DIR,
+    "features"
+)
+
 os.makedirs(
     OUTPUT_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    TEMP_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    DUCKDB_TEMP_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    FEATURE_DIR,
     exist_ok=True
 )
 
@@ -101,6 +166,26 @@ SOURCE3_PATH = os.path.join(
 
 
 # ============================================================
+# TEMP FEATURE FILES
+# ============================================================
+
+S1_FEATURE_PATH = os.path.join(
+    FEATURE_DIR,
+    "s1_blocking_features.parquet"
+)
+
+S2_FEATURE_PATH = os.path.join(
+    FEATURE_DIR,
+    "s2_blocking_features.parquet"
+)
+
+S3_FEATURE_PATH = os.path.join(
+    FEATURE_DIR,
+    "s3_blocking_features.parquet"
+)
+
+
+# ============================================================
 # OUTPUT FILE
 # ============================================================
 
@@ -109,29 +194,39 @@ OUTPUT_PATH = os.path.join(
     "candidate_pairs_train.tsv"
 )
 
+DUCKDB_PATH = os.path.join(
+    TEMP_DIR,
+    "blocking.duckdb"
+)
+
 
 # ============================================================
 # REQUIRED COLUMNS
 # ============================================================
 
-REQUIRED_COLUMNS = {
+REQUIRED_COLUMNS = [
     "entity_id",
     "name_core",
     "address_clean",
     "address_tokens",
     "name_sorted",
-    "country_clean"
-}
+    "country_clean",
+]
 
 
 # ============================================================
-# LOAD CLEAN PARQUET
+# VALIDATE INPUT
 # ============================================================
 
-def load_clean_parquet(path):
+def validate_input(path):
 
-    print(f"\nLoading:")
-    print(path)
+    print(
+        f"\nChecking input:"
+    )
+
+    print(
+        path
+    )
 
     if not os.path.exists(path):
 
@@ -139,32 +234,176 @@ def load_clean_parquet(path):
             f"\nFile not found:\n{path}"
         )
 
-    required_columns = [
-        "entity_id",
-        "name_core",
-        "address_clean",
-        "address_tokens",
-        "name_sorted",
-        "country_clean",
-    ]
+    parquet_file = pq.ParquetFile(
+        path
+    )
 
-    df = pd.read_parquet(path, columns=required_columns)
+    available = set(
+        parquet_file.schema_arrow.names
+    )
 
-    missing = REQUIRED_COLUMNS - set(df.columns)
+    missing = set(
+        REQUIRED_COLUMNS
+    ) - available
 
     if missing:
 
         raise ValueError(
             f"\n{path}\n"
-            f"Missing expected cleaned columns: {missing}\n"
-            f"Make sure this is the output from data_cleaning.py."
+            f"Missing expected columns: {missing}"
         )
 
     print(
-        f"Loaded successfully: {df.shape}"
+        "Input OK"
     )
 
-    return df
+    print(
+        f"Rows: {parquet_file.metadata.num_rows:,}"
+    )
+
+    return parquet_file.metadata.num_rows
+
+
+# ============================================================
+# GENERATE BLOCKING FEATURES IN BATCHES
+# ============================================================
+
+def create_feature_parquet(
+    input_path,
+    output_path,
+    minhasher,
+):
+    """
+    Read the cleaned Parquet in batches, generate blocking features
+    using the existing blocking_keys.py implementation, and write the
+    result back to Parquet.
+
+    At no point is the complete source loaded into pandas.
+    """
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "CREATING BLOCKING FEATURES"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"Input : {input_path}"
+    )
+
+    print(
+        f"Output: {output_path}"
+    )
+
+    if os.path.exists(output_path):
+
+        print(
+            "Removing previous feature file..."
+        )
+
+        os.remove(
+            output_path
+        )
+
+    parquet_file = pq.ParquetFile(
+        input_path
+    )
+
+    writer = None
+
+    total_rows = 0
+
+    start_time = time.time()
+
+    try:
+
+        batch_number = 0
+
+        for record_batch in parquet_file.iter_batches(
+            batch_size=FEATURE_BATCH_SIZE,
+            columns=REQUIRED_COLUMNS
+        ):
+
+            batch_number += 1
+
+            print(
+                f"\nBatch {batch_number}"
+            )
+
+            print(
+                f"Rows: {record_batch.num_rows:,}"
+            )
+
+            df = record_batch.to_pandas()
+
+            # ------------------------------------------------
+            # EXISTING BLOCKING FEATURE LOGIC
+            # ------------------------------------------------
+
+            df = add_blocking_keys(
+                df,
+                minhasher,
+                NUM_BANDS,
+                ROWS_PER_BAND
+            )
+
+            # ------------------------------------------------
+            # WRITE BATCH
+            # ------------------------------------------------
+
+            table = pa.Table.from_pandas(
+                df,
+                preserve_index=False
+            )
+
+            if writer is None:
+
+                writer = pq.ParquetWriter(
+                    output_path,
+                    table.schema,
+                    compression="zstd"
+                )
+
+            writer.write_table(
+                table
+            )
+
+            total_rows += len(df)
+
+            del table
+            del df
+
+            print(
+                f"Processed total: {total_rows:,}"
+            )
+
+    finally:
+
+        if writer is not None:
+
+            writer.close()
+
+    elapsed = time.time() - start_time
+
+    print(
+        f"\nFeature generation complete:"
+    )
+
+    print(
+        f"Rows: {total_rows:,}"
+    )
+
+    print(
+        f"Time: {elapsed:.1f} seconds"
+    )
+
+    return total_rows
 
 
 # ============================================================
@@ -173,131 +412,146 @@ def load_clean_parquet(path):
 
 def main():
 
-    print("=" * 70)
-    print("BLOCKING-ONLY ENTITY MATCHING PIPELINE")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
 
-    print("\nProject root:")
-    print(PROJECT_ROOT)
+    print(
+        "MEMORY-SAFE ENTITY RESOLUTION BLOCKING PIPELINE"
+    )
 
-    print("\nProcessed data directory:")
-    print(PROCESSED_DIR)
+    print(
+        "=" * 70
+    )
 
-    print("\nOutput directory:")
-    print(OUTPUT_DIR)
+    print(
+        "\nProject root:"
+    )
 
-    # --------------------------------------------------------
-    # LOAD DATA
-    # --------------------------------------------------------
+    print(
+        PROJECT_ROOT
+    )
 
-    print("\n" + "=" * 70)
-    print("LOADING CLEANED DATA")
-    print("=" * 70)
+    print(
+        "\nInput directory:"
+    )
 
-    start_time = time.time()
+    print(
+        PROCESSED_DIR
+    )
 
-    s1c = load_clean_parquet(
+    print(
+        "\nTemporary directory:"
+    )
+
+    print(
+        TEMP_DIR
+    )
+
+    print(
+        "\nDuckDB memory limit:"
+    )
+
+    print(
+        DUCKDB_MEMORY_LIMIT
+    )
+
+
+    # ========================================================
+    # VALIDATE INPUTS
+    # ========================================================
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "VALIDATING INPUT DATA"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    s1_rows = validate_input(
         SOURCE1_PATH
     )
 
-    s2c = load_clean_parquet(
+    s2_rows = validate_input(
         SOURCE2_PATH
     )
 
-    s3c = load_clean_parquet(
+    s3_rows = validate_input(
         SOURCE3_PATH
     )
 
-    all_s1_ids = s1c[
-        "entity_id"
-    ].tolist()
-
     print(
-        f"\nS1 = {len(s1c)}"
+        "\nTotal rows:"
     )
 
     print(
-        f"S2 = {len(s2c)}"
+        f"S1: {s1_rows:,}"
     )
 
     print(
-        f"S3 = {len(s3c)}"
+        f"S2: {s2_rows:,}"
     )
 
     print(
-        f"Loading took "
-        f"{time.time() - start_time:.1f} seconds"
+        f"S3: {s3_rows:,}"
     )
-
-
-    # --------------------------------------------------------
-    # COMBINE S2 + S3
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("CREATING POOL")
-    print("=" * 70)
-
-    pool = pd.concat(
-        [
-            s2c,
-            s3c
-        ],
-        ignore_index=True
-    )
-
-    # We don't need separate S2/S3 dataframes anymore
-    del s2c
-    del s3c
 
     print(
-        f"Pool size: {len(pool)}"
+        f"TOTAL: {s1_rows + s2_rows + s3_rows:,}"
     )
 
 
-    # --------------------------------------------------------
-    # ADD BLOCKING FEATURES
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("ADDING BLOCKING-KEY FEATURES")
-    print("=" * 70)
-
-    start_time = time.time()
+    # ========================================================
+    # MINHASH
+    # ========================================================
 
     minhasher = MinHasher(
-        num_hashes=
-            NUM_BANDS * ROWS_PER_BAND,
+        num_hashes=(
+            NUM_BANDS *
+            ROWS_PER_BAND
+        ),
         seed=RANDOM_SEED
     )
 
-    print("\nProcessing Source 1...")
 
-    s1_feat = add_blocking_keys(
-        s1c,
-        minhasher,
-        NUM_BANDS,
-        ROWS_PER_BAND
+    # ========================================================
+    # CREATE FEATURE FILES
+    # ========================================================
+
+    start_time = time.time()
+
+    create_feature_parquet(
+        SOURCE1_PATH,
+        S1_FEATURE_PATH,
+        minhasher
     )
 
-    print("Processing S2 + S3 pool...")
+    create_feature_parquet(
+        SOURCE2_PATH,
+        S2_FEATURE_PATH,
+        minhasher
+    )
 
-    pool_feat = add_blocking_keys(
-        pool,
-        minhasher,
-        NUM_BANDS,
-        ROWS_PER_BAND
+    create_feature_parquet(
+        SOURCE3_PATH,
+        S3_FEATURE_PATH,
+        minhasher
     )
 
     print(
-        f"\nBlocking features added in "
+        f"\nAll blocking features generated in "
         f"{time.time() - start_time:.1f} seconds"
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # BLOCKING COLUMNS
-    # --------------------------------------------------------
+    # ========================================================
 
     key_columns = [
         "name_sorted",
@@ -309,27 +563,117 @@ def main():
         NUM_BANDS
     )
 
-    print("\nBlocking columns:")
+    print(
+        "\nBlocking columns:"
+    )
 
     for column in key_columns:
+
         print(
             f"  - {column}"
         )
 
 
-    # --------------------------------------------------------
-    # GENERATE CANDIDATES
-    # --------------------------------------------------------
+    # ========================================================
+    # OPEN DUCKDB
+    # ========================================================
 
-    print("\n" + "=" * 70)
-    print("GENERATING CANDIDATE PAIRS")
-    print("=" * 70)
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "STARTING DUCKDB"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    con = duckdb.connect(
+        DUCKDB_PATH
+    )
+
+    configure_duckdb(
+        con,
+        memory_limit=DUCKDB_MEMORY_LIMIT,
+        threads=DUCKDB_THREADS,
+        temp_directory=DUCKDB_TEMP_DIR,
+        max_temp_directory_size=DUCKDB_TEMP_LIMIT
+    )
+
+
+    # ========================================================
+    # INSPECT BLOCKS FIRST
+    # ========================================================
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "INSPECTING BLOCK SIZES"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    block_stats = inspect_blocks(
+        con,
+        S1_FEATURE_PATH,
+        [
+            S2_FEATURE_PATH,
+            S3_FEATURE_PATH
+        ],
+        key_columns,
+        max_block_size=MAX_BLOCK_SIZE
+    )
+
+    print(
+        "\n" + "-" * 70
+    )
+
+    print(
+        "BLOCKING SUMMARY"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    print(
+        block_stats.to_string(
+            index=False
+        )
+    )
+
+
+    # ========================================================
+    # GENERATE CANDIDATES
+    # ========================================================
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "GENERATING CANDIDATE PAIRS"
+    )
+
+    print(
+        "=" * 70
+    )
 
     start_time = time.time()
 
-    pairs_df = generate_candidates(
-        s1_feat,
-        pool_feat,
+    generate_candidates(
+        con,
+        S1_FEATURE_PATH,
+        [
+            S2_FEATURE_PATH,
+            S3_FEATURE_PATH
+        ],
         key_columns,
         max_block_size=MAX_BLOCK_SIZE
     )
@@ -339,42 +683,71 @@ def main():
         f"{time.time() - start_time:.1f} seconds"
     )
 
-    print(
-        f"Total candidate pairs: "
-        f"{len(pairs_df)}"
-    )
 
+    # ========================================================
+    # FINAL STATISTICS
+    # ========================================================
 
-    # --------------------------------------------------------
-    # CONVERT TO ID LIST FORMAT
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("PREPARING OUTPUT")
-    print("=" * 70)
-
-    out_df = pairs_to_id_list_rows(
-        pairs_df,
-        all_s1_ids
+    stats = candidate_statistics(
+        con,
+        S1_FEATURE_PATH
     )
 
     print(
-        f"Output rows: {len(out_df)}"
+        "\n" + "=" * 70
+    )
+
+    print(
+        "FINAL CANDIDATE STATISTICS"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"S1 entities:"
+        f" {stats['s1_entities']:,}"
+    )
+
+    print(
+        f"Candidate pairs:"
+        f" {stats['total_candidate_pairs']:,}"
+    )
+
+    print(
+        f"Average candidates per S1:"
+        f" {stats['average_candidates_per_s1']:.1f}"
     )
 
 
-    # --------------------------------------------------------
-    # SAVE TSV
-    # --------------------------------------------------------
+    # ========================================================
+    # WRITE FINAL OUTPUT
+    # ========================================================
 
-    print("\n" + "=" * 70)
-    print("SAVING OUTPUT")
-    print("=" * 70)
+    print(
+        "\n" + "=" * 70
+    )
 
-    out_df.to_csv(
-        OUTPUT_PATH,
-        sep="\t",
-        index=False
+    print(
+        "WRITING FINAL OUTPUT"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    start_time = time.time()
+
+    write_candidate_output(
+        con,
+        S1_FEATURE_PATH,
+        OUTPUT_PATH
+    )
+
+    print(
+        f"\nOutput written in "
+        f"{time.time() - start_time:.1f} seconds"
     )
 
     print(
@@ -386,23 +759,35 @@ def main():
     )
 
 
-    # --------------------------------------------------------
-    # FINAL STATISTICS
-    # --------------------------------------------------------
+    # ========================================================
+    # CLEANUP
+    # ========================================================
 
-    avg_candidates = (
-        len(pairs_df)
-        / max(len(all_s1_ids), 1)
+    con.close()
+
+    print(
+        "\n" + "=" * 70
     )
 
     print(
-        f"\nAverage candidates per S1 entity: "
-        f"{avg_candidates:.1f}"
+        "BLOCKING COMPLETE"
     )
 
-    print("\n" + "=" * 70)
-    print("BLOCKING COMPLETE")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
+    print(
+        "\nTemporary DuckDB/feature files are located at:"
+    )
+
+    print(
+        TEMP_DIR
+    )
+
+    print(
+        "\nYou can delete this directory after verifying the output."
+    )
 
 
 # ============================================================
@@ -410,4 +795,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
